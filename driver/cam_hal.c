@@ -34,6 +34,8 @@
 
 static const char *TAG = "cam_hal";
 static cam_obj_t *cam_obj = NULL;
+static bool s_fragment_mode = false;
+static bool s_zero_padding = false;
 
 static const uint32_t JPEG_SOI_MARKER = 0xFFD8FF;  // written in little-endian for esp32
 static const uint16_t JPEG_EOI_MARKER = 0xD9FF;  // written in little-endian for esp32
@@ -159,6 +161,24 @@ static void cam_task(void *arg)
                         ll_cam_stop(cam_obj);
                         cam_obj->state = CAM_STATE_IDLE;
                     }
+                    if (s_fragment_mode && cam_obj->state != CAM_STATE_IDLE) {
+                        if (cam_obj->fb_size < (frame_buffer_event->len + pixels_per_dma)) {
+                            cam_obj->frames[frame_pos].en = 0;
+                            if (xQueueSend(cam_obj->frame_buffer_queue, (void *) &frame_buffer_event, 0) == pdTRUE) {
+                                if (cam_get_next_frame(&frame_pos)) {
+                                    cam_obj->frames[frame_pos].fb.len = 0;
+                                } else {
+                                    ESP_LOGW(TAG, "FBQ-RCV");
+                                    cam_obj->frames[frame_pos].fb.len = 0;
+                                    cam_obj->frames[frame_pos].en = 1;
+                                }
+                            } else {
+                                ESP_LOGW(TAG, "FBQ-SND");
+                                cam_obj->frames[frame_pos].fb.len = 0;
+                                cam_obj->frames[frame_pos].en = 1;
+                            }
+                        }
+                    }
                     cnt++;
 
                 } else if (cam_event == CAM_VSYNC_EVENT) {
@@ -193,6 +213,13 @@ static void cam_task(void *arg)
                             if (frame_buffer_event->len != cam_obj->fb_size) {
                                 cam_obj->frames[frame_pos].en = 1;
                                 ESP_LOGE(TAG, "FB-SIZE: %u != %u", frame_buffer_event->len, cam_obj->fb_size);
+                            }
+                        }
+                        if (s_zero_padding) {
+                            size_t padding = (cam_obj->fb_size / pixels_per_dma) * pixels_per_dma;
+                            if (frame_buffer_event->len < padding) {
+                                memset(&frame_buffer_event->buf[frame_buffer_event->len], 0, padding - frame_buffer_event->len);
+                                frame_buffer_event->len = padding;
                             }
                         }
                         //send frame
@@ -328,6 +355,8 @@ esp_err_t cam_init(const camera_config_t *config)
     cam_obj->swap_data = 0;
     cam_obj->vsync_pin = config->pin_vsync;
     cam_obj->vsync_invert = true;
+    s_fragment_mode = config->fragment_mode;
+    s_zero_padding = config->zero_padding;
 
     ll_cam_set_pin(cam_obj, config);
     ret = ll_cam_config(cam_obj, config);
@@ -462,6 +491,9 @@ camera_fb_t *cam_take(TickType_t timeout)
     TickType_t start = xTaskGetTickCount();
     xQueueReceive(cam_obj->frame_buffer_queue, (void *)&dma_buffer, timeout);
     if (dma_buffer) {
+        if (s_fragment_mode) {
+            return dma_buffer;
+        }
         if(cam_obj->jpeg_mode){
             // find the end marker for JPEG. Data after that can be discarded
             int offset_e = cam_verify_jpeg_eoi(dma_buffer->buf, dma_buffer->len);
